@@ -1,40 +1,36 @@
 /*
- * main.c - LBTiny Supervisor, Step 3
- * ==================================
+ * main.c - LBTiny Supervisor, Step 3 / v3 protocol
+ * ================================================
  *
- * Goal: Receive a binary payload from the host IDE, compute its CRC using
- * the verified peripheral path, and send back a response containing both
- * the host-claimed length and the computed CRC. This is the protocol that
- * the IDE's transfer dialog (Step 4) will speak.
+ * Receive binary payloads, compute CRCs, send back framed responses.
+ * Protocol now uses a command code byte so we can add more commands
+ * (flash read, sector erase, status query, etc.) without breaking framing.
  *
  * Protocol:
- *   IDE -> Nucleo:  0xA5  [len_le_4B]  [payload...]
- *   Nucleo -> IDE:  0x5A  [recv_len_le_4B]  [crc32_le_4B]
+ *   PC -> Nucleo:  0xA5  [cmd_1B]  [len_le_4B]  [payload...]
+ *   Nucleo -> PC:  0x5A  [cmd_1B]  [status_1B]  [data_len_le_4B]  [data...]
  *
- * Where:
- *   - len_le_4B    = host's declared payload size, little-endian uint32
- *   - recv_len_le_4B = echoes the host's declared length verbatim (NOT the
- *                    number of bytes we stored). This lets the host detect
- *                    overflow as "lengths match but CRC mismatches" vs
- *                    truncation as "lengths disagree."
- *   - crc32_le_4B  = STM32F4 CRC over the bytes we stored, max 4096
+ * Commands implemented:
+ *   CMD_TRANSFER_CRC (0x01):
+ *      payload = bytes to be CRC'd (declared by len_le_4B)
+ *      response data = [declared_len_le_4B] [crc_le_4B]  (8 bytes)
+ *      status: 0x00 = OK
+ *              0x01 = overflow (declared_len > MAX, CRC over stored portion)
+ *
+ * Future commands (not yet implemented):
+ *   CMD_PING (0x02), CMD_FLASH_READ (0x10), CMD_FLASH_ERASE (0x11), etc.
+ *   Unknown commands return status=0xFF with data_len=0.
  *
  * State machine:
- *   WAIT_SYNC     -> got 0xA5?         -> READ_LEN
+ *   WAIT_FRAME    -> got 0xA5?         -> READ_CMD
+ *   READ_CMD      -> got 1 byte?       -> READ_LEN
  *   READ_LEN      -> got 4 bytes?      -> if len > 0: READ_PAYLOAD
  *                                         else:       READY
  *   READ_PAYLOAD  -> got len bytes?    -> READY
  *                 -> hit MAX limit?    -> DRAIN_OVERFLOW
- *                    (or stale > 1.5s) -> TIMEOUT -> WAIT_SYNC
+ *                    (or stale > 1.5s) -> TIMEOUT -> WAIT_FRAME
  *   DRAIN_OVERFLOW-> declared bytes done? -> READY
- *   READY         -> main loop: compute CRC, send response, -> WAIT_SYNC
- *
- * Overflow handling: if host declares len > 4096, we still drain all
- * declared bytes off the wire (only storing the first 4096) so the next
- * transfer's framing isn't lost. CRC is over the stored portion only.
- *
- * Inter-byte timeout: 1500 ms. If we're mid-transfer and no bytes arrive
- * for that long, we abort to WAIT_SYNC. The host can retry.
+ *   READY         -> main loop: dispatch command, send response, -> WAIT_FRAME
  *
  * Byte-to-word packing for CRC: little-endian (matches Step 1/2 convention).
  */
@@ -50,6 +46,14 @@
 /* ------------------------------------------------------------------------ */
 #define SYNC_HOST_TO_NUCLEO   0xA5u
 #define SYNC_NUCLEO_TO_HOST   0x5Au
+
+#define CMD_TRANSFER_CRC      0x01u    /* echo + CRC the payload */
+/* Future commands reserve their own codes here */
+
+#define STATUS_OK             0x00u
+#define STATUS_OVERFLOW       0x01u
+#define STATUS_UNKNOWN_CMD    0xFFu
+
 #define MAX_PAYLOAD_BYTES     4096u
 #define TIMEOUT_MS            1500u
 
@@ -63,27 +67,30 @@ static CRC_HandleTypeDef  hcrc;
 /* Receive state machine                                                    */
 /* ------------------------------------------------------------------------ */
 typedef enum {
-    RX_STATE_WAIT_SYNC = 0,
+    RX_STATE_WAIT_FRAME = 0,
+    RX_STATE_READ_CMD,
     RX_STATE_READ_LEN,
     RX_STATE_READ_PAYLOAD,
     RX_STATE_DRAIN_OVERFLOW,
-    RX_STATE_READY,        /* full transfer received, main loop will process */
+    RX_STATE_READY,
 } rx_state_t;
 
-static volatile rx_state_t rx_state = RX_STATE_WAIT_SYNC;
-static volatile uint32_t   last_rx_tick = 0;   /* HAL_GetTick() of last byte */
+static volatile rx_state_t rx_state = RX_STATE_WAIT_FRAME;
+static volatile uint32_t   last_rx_tick = 0;
 
-/* Staging buffers used by the RX ISR */
-static uint8_t  sync_byte_buf;
+/* Staging buffers for the RX ISR */
+static uint8_t  frame_byte_buf;
+static uint8_t  cmd_byte_buf;
 static uint8_t  len_bytes_buf[4];
-static uint8_t  payload_byte_buf;          /* single-byte arming for payload */
-static uint8_t  drain_byte_buf;            /* single-byte arming for overflow drain */
+static uint8_t  payload_byte_buf;
+static uint8_t  drain_byte_buf;
 
 /* Transfer payload buffer + bookkeeping */
 static uint8_t  rx_payload[MAX_PAYLOAD_BYTES];
-static volatile uint32_t declared_len = 0;     /* what host said */
-static volatile uint32_t stored_count = 0;     /* what we actually kept */
-static volatile uint32_t drained_count = 0;    /* bytes drained beyond MAX */
+static volatile uint8_t  current_cmd = 0;
+static volatile uint32_t declared_len = 0;
+static volatile uint32_t stored_count = 0;
+static volatile uint32_t drained_count = 0;
 
 /* ------------------------------------------------------------------------ */
 /* Forward declarations                                                     */
@@ -95,11 +102,13 @@ static void CRC_Init(void);
 
 static uint32_t compute_crc(const uint8_t *data, uint32_t len);
 static void uart_print(const char *s);
-static void uart_printf(const char *fmt, ...);
 static void uart_send_raw(const uint8_t *data, uint16_t len);
 
-static void rx_reset_to_wait_sync(void);
-static void rx_process_transfer(void);
+static void rx_reset_to_wait_frame(void);
+static void dispatch_command(void);
+static void handle_cmd_transfer_crc(void);
+static void send_response(uint8_t cmd, uint8_t status,
+                          const uint8_t *data, uint32_t data_len);
 
 /* ------------------------------------------------------------------------ */
 /* main                                                                     */
@@ -115,110 +124,121 @@ int main(void)
     HAL_Delay(500);
     uart_print("\r\n");
     uart_print("============================================================\r\n");
-    uart_print("LBTiny Supervisor - Step 3: receive protocol [v2]\r\n");
-    uart_print("Protocol: 0xA5 [len_le_4B] [payload]  ->  0x5A [len_le_4B] [crc_le_4B]\r\n");
+    uart_print("LBTiny Supervisor - protocol v3 (command-framed)\r\n");
+    uart_print("Frame: 0xA5 [cmd] [len_le_4B] [payload]\r\n");
+    uart_print("       -> 0x5A [cmd] [status] [data_len_le_4B] [data]\r\n");
     uart_print("Max payload: 4096 bytes.  Inter-byte timeout: 1500 ms.\r\n");
     uart_print("============================================================\r\n");
     uart_print("\r\n");
 
-    /* Prime the receive: wait for sync byte */
-    rx_reset_to_wait_sync();
+    rx_reset_to_wait_frame();
 
     uint32_t blink_tick = HAL_GetTick();
 
     while (1) {
-        /* Heartbeat LED at 1 Hz so we know the chip is alive */
         if ((HAL_GetTick() - blink_tick) >= 500u) {
             HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
             blink_tick = HAL_GetTick();
         }
 
-        /* Inter-byte timeout: if we're mid-transfer and stale, abort */
-        if (rx_state == RX_STATE_READ_LEN ||
-            rx_state == RX_STATE_READ_PAYLOAD ||
-            rx_state == RX_STATE_DRAIN_OVERFLOW) {
+        /* Inter-byte timeout */
+        if (rx_state != RX_STATE_WAIT_FRAME && rx_state != RX_STATE_READY) {
             if ((HAL_GetTick() - last_rx_tick) > TIMEOUT_MS) {
-                uart_print("[timeout] transfer aborted, returning to WAIT_SYNC\r\n");
-                /* Cancel the pending receive request before re-arming. */
                 HAL_UART_AbortReceive_IT(&huart2);
-                rx_reset_to_wait_sync();
+                rx_reset_to_wait_frame();
             }
         }
 
-        /* Process a fully-received transfer */
         if (rx_state == RX_STATE_READY) {
-            rx_process_transfer();
-            rx_reset_to_wait_sync();
+            dispatch_command();
+            rx_reset_to_wait_frame();
         }
     }
 }
 
 /* ------------------------------------------------------------------------ */
-/* Receive state helpers                                                    */
+/* Receive helpers                                                          */
 /* ------------------------------------------------------------------------ */
-
-/*
- * rx_reset_to_wait_sync - return the receiver to the idle state and arm
- * a 1-byte receive waiting for the sync byte.
- */
-static void rx_reset_to_wait_sync(void)
+static void rx_reset_to_wait_frame(void)
 {
-    rx_state      = RX_STATE_WAIT_SYNC;
+    rx_state      = RX_STATE_WAIT_FRAME;
+    current_cmd   = 0;
     declared_len  = 0;
     stored_count  = 0;
     drained_count = 0;
     last_rx_tick  = HAL_GetTick();
-    HAL_UART_Receive_IT(&huart2, &sync_byte_buf, 1);
+    HAL_UART_Receive_IT(&huart2, &frame_byte_buf, 1);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Command dispatch                                                         */
+/* ------------------------------------------------------------------------ */
+static void dispatch_command(void)
+{
+    switch (current_cmd) {
+    case CMD_TRANSFER_CRC:
+        handle_cmd_transfer_crc();
+        break;
+    default:
+        /* Unknown command - report and move on */
+        send_response(current_cmd, STATUS_UNKNOWN_CMD, NULL, 0);
+        break;
+    }
+}
+
+static void handle_cmd_transfer_crc(void)
+{
+    uint32_t crc = compute_crc(rx_payload, stored_count);
+    uint8_t  status = (declared_len > MAX_PAYLOAD_BYTES)
+                    ? STATUS_OVERFLOW
+                    : STATUS_OK;
+
+    /* Response data: [declared_len_le_4B] [crc_le_4B] = 8 bytes */
+    uint8_t data[8];
+    data[0] = (uint8_t)(declared_len      & 0xFFu);
+    data[1] = (uint8_t)((declared_len >> 8)  & 0xFFu);
+    data[2] = (uint8_t)((declared_len >> 16) & 0xFFu);
+    data[3] = (uint8_t)((declared_len >> 24) & 0xFFu);
+    data[4] = (uint8_t)(crc          & 0xFFu);
+    data[5] = (uint8_t)((crc >> 8)   & 0xFFu);
+    data[6] = (uint8_t)((crc >> 16)  & 0xFFu);
+    data[7] = (uint8_t)((crc >> 24)  & 0xFFu);
+
+    send_response(CMD_TRANSFER_CRC, status, data, sizeof(data));
 }
 
 /*
- * rx_process_transfer - compute CRC over received payload, send response.
- * Called from the main loop when rx_state == RX_STATE_READY.
- *
- * Response format: 0x5A [declared_len_le_4B] [crc_le_4B] = 9 bytes total.
- * The declared length is echoed verbatim (NOT the stored count), so the
- * host can distinguish overflow (lengths match, CRC mismatches) from
- * truncation/drop (lengths disagree).
+ * send_response - assemble and transmit a framed response in a single
+ * UART transmit call so it doesn't race with incoming bytes for the
+ * next command (the issue we hit in v1 with separate uart_printf).
  */
-static void rx_process_transfer(void)
+static void send_response(uint8_t cmd, uint8_t status,
+                          const uint8_t *data, uint32_t data_len)
 {
-    uint32_t crc = compute_crc(rx_payload, stored_count);
+    /* Max response: 1 sync + 1 cmd + 1 status + 4 data_len + data_len bytes.
+     * For CMD_TRANSFER_CRC: 7 + 8 = 15 bytes. Sized for headroom. */
+    uint8_t buf[64];
+    if (data_len > sizeof(buf) - 7u) {
+        /* Defensive - shouldn't happen with current commands */
+        data_len = sizeof(buf) - 7u;
+    }
 
-    uint8_t response[9];
-    response[0] = SYNC_NUCLEO_TO_HOST;
-    response[1] = (uint8_t)(declared_len      & 0xFFu);
-    response[2] = (uint8_t)((declared_len >> 8)  & 0xFFu);
-    response[3] = (uint8_t)((declared_len >> 16) & 0xFFu);
-    response[4] = (uint8_t)((declared_len >> 24) & 0xFFu);
-    response[5] = (uint8_t)(crc           & 0xFFu);
-    response[6] = (uint8_t)((crc >> 8)    & 0xFFu);
-    response[7] = (uint8_t)((crc >> 16)   & 0xFFu);
-    response[8] = (uint8_t)((crc >> 24)   & 0xFFu);
-    uart_send_raw(response, sizeof(response));
-
-    /*
-     * NOTE: No human-readable diagnostic line here. Sending text after the
-     * binary response races with the next transfer's incoming bytes and can
-     * trigger a UART overrun that fires HAL_UART_ErrorCallback and resets
-     * the state machine mid-transfer. The binary response is sufficient;
-     * the host script prints all relevant values on its side.
-     *
-     * If you need the diagnostic line during dev, gate it behind a flag:
-     *   #ifdef LBTINY_VERBOSE_XFER
-     *   uart_printf("[xfer] declared=%lu ...\r\n", ...);
-     *   #endif
-     * and only enable it when running the monitor manually (not the test script).
-     */
+    buf[0] = SYNC_NUCLEO_TO_HOST;
+    buf[1] = cmd;
+    buf[2] = status;
+    buf[3] = (uint8_t)(data_len       & 0xFFu);
+    buf[4] = (uint8_t)((data_len >> 8)  & 0xFFu);
+    buf[5] = (uint8_t)((data_len >> 16) & 0xFFu);
+    buf[6] = (uint8_t)((data_len >> 24) & 0xFFu);
+    if (data_len > 0 && data != NULL) {
+        memcpy(&buf[7], data, data_len);
+    }
+    uart_send_raw(buf, (uint16_t)(7u + data_len));
 }
 
 /* ------------------------------------------------------------------------ */
 /* HAL receive callback - drives the state machine                          */
 /* ------------------------------------------------------------------------ */
-/*
- * Keep ISR work short: update state, re-arm next receive. No printf, no
- * CRC, no blocking calls in here. Heavy work is deferred to the main loop
- * (which polls for RX_STATE_READY).
- */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart != &huart2) {
@@ -228,15 +248,19 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
     switch (rx_state) {
 
-    case RX_STATE_WAIT_SYNC:
-        if (sync_byte_buf == SYNC_HOST_TO_NUCLEO) {
-            rx_state = RX_STATE_READ_LEN;
-            HAL_UART_Receive_IT(&huart2, len_bytes_buf, 4);
+    case RX_STATE_WAIT_FRAME:
+        if (frame_byte_buf == SYNC_HOST_TO_NUCLEO) {
+            rx_state = RX_STATE_READ_CMD;
+            HAL_UART_Receive_IT(&huart2, &cmd_byte_buf, 1);
         } else {
-            /* Wrong byte: re-arm and wait. Stray bytes (terminal noise,
-             * resync after a timeout, etc.) just get dropped silently. */
-            HAL_UART_Receive_IT(&huart2, &sync_byte_buf, 1);
+            HAL_UART_Receive_IT(&huart2, &frame_byte_buf, 1);
         }
+        break;
+
+    case RX_STATE_READ_CMD:
+        current_cmd = cmd_byte_buf;
+        rx_state = RX_STATE_READ_LEN;
+        HAL_UART_Receive_IT(&huart2, len_bytes_buf, 4);
         break;
 
     case RX_STATE_READ_LEN:
@@ -247,7 +271,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         stored_count  = 0;
         drained_count = 0;
         if (declared_len == 0) {
-            /* Empty payload - skip straight to processing */
             rx_state = RX_STATE_READY;
         } else {
             rx_state = RX_STATE_READ_PAYLOAD;
@@ -262,15 +285,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         stored_count++;
 
         if (stored_count >= declared_len) {
-            /* Got everything declared */
             rx_state = RX_STATE_READY;
         } else if (stored_count >= MAX_PAYLOAD_BYTES) {
-            /* Buffer full but more bytes still coming - drain them so we
-             * stay aligned on the next transfer's framing. */
             rx_state = RX_STATE_DRAIN_OVERFLOW;
             HAL_UART_Receive_IT(&huart2, &drain_byte_buf, 1);
         } else {
-            /* More to come, stay in this state */
             HAL_UART_Receive_IT(&huart2, &payload_byte_buf, 1);
         }
         break;
@@ -285,39 +304,28 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         break;
 
     case RX_STATE_READY:
-        /* Shouldn't happen - main loop should have consumed READY before
-         * we arm another receive. Defensive: ignore. */
+        /* Main loop should consume READY before we re-arm. Defensive. */
         break;
     }
 }
 
-/*
- * HAL_UART_ErrorCallback - HAL drops us here on framing/overrun/etc.
- * Most likely during dev: PC closing the COM port mid-transfer.
- * Reset cleanly and wait for the next sync.
- */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart == &huart2) {
-        rx_reset_to_wait_sync();
+        rx_reset_to_wait_frame();
     }
 }
 
 /* ------------------------------------------------------------------------ */
-/* CRC computation - unchanged from Step 2 (verified path)                  */
+/* CRC computation (verified path from Step 2)                              */
 /* ------------------------------------------------------------------------ */
 static uint32_t compute_crc(const uint8_t *data, uint32_t len)
 {
-    /* Word buffer sized for MAX_PAYLOAD_BYTES + padding. ~4 KB - fine
-     * on the F446's 128 KB SRAM. Marked static so it doesn't sit on the
-     * (small) main-thread stack. */
     static uint32_t words[(MAX_PAYLOAD_BYTES + 3) / 4 + 1];
 
     uint32_t padded_len = (len + 3u) & ~3u;
     uint32_t num_words = padded_len / 4u;
 
-    /* Pack bytes into 32-bit little-endian words, padding with 0xFF beyond
-     * the actual data length (matches Python's stm32_crc.py convention). */
     for (uint32_t w = 0; w < num_words; w++) {
         uint32_t base = w * 4u;
         uint8_t b0 = (base + 0 < len) ? data[base + 0] : 0xFFu;
@@ -330,12 +338,6 @@ static uint32_t compute_crc(const uint8_t *data, uint32_t len)
                  | (((uint32_t)b3) << 24);
     }
 
-    /*
-     * Reset CRC peripheral to initial value 0xFFFFFFFF.
-     * __DSB() ensures the reset propagates before we read/use DR.
-     * Without it, at low optimization a read races the peripheral and
-     * returns stale data (Step 2 diagnostic confirmed this).
-     */
     __HAL_CRC_DR_RESET(&hcrc);
     __DSB();
 
@@ -346,7 +348,7 @@ static uint32_t compute_crc(const uint8_t *data, uint32_t len)
 }
 
 /* ------------------------------------------------------------------------ */
-/* UART output helpers                                                      */
+/* UART helpers                                                             */
 /* ------------------------------------------------------------------------ */
 static void uart_send_raw(const uint8_t *data, uint16_t len)
 {
@@ -358,22 +360,8 @@ static void uart_print(const char *s)
     HAL_UART_Transmit(&huart2, (uint8_t *)s, (uint16_t)strlen(s), HAL_MAX_DELAY);
 }
 
-static void uart_printf(const char *fmt, ...)
-{
-    char buf[160];
-    va_list args;
-    va_start(args, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    if (n > 0) {
-        HAL_UART_Transmit(&huart2, (uint8_t *)buf,
-                          (uint16_t)((n < (int)sizeof(buf)) ? n : (int)sizeof(buf) - 1),
-                          HAL_MAX_DELAY);
-    }
-}
-
 /* ------------------------------------------------------------------------ */
-/* Peripheral initialization (unchanged from Step 2, except USART2 IRQ)     */
+/* Peripheral init                                                          */
 /* ------------------------------------------------------------------------ */
 static void SystemClock_Config(void)
 {
@@ -432,7 +420,6 @@ static void USART2_Init(void)
     huart2.Init.OverSampling = UART_OVERSAMPLING_16;
     if (HAL_UART_Init(&huart2) != HAL_OK) { while (1) {} }
 
-    /* Enable USART2 interrupt - required for HAL_UART_Receive_IT to work */
     HAL_NVIC_SetPriority(USART2_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
 }
@@ -447,12 +434,5 @@ static void CRC_Init(void)
 /* ------------------------------------------------------------------------ */
 /* IRQ handlers                                                             */
 /* ------------------------------------------------------------------------ */
-void SysTick_Handler(void)
-{
-    HAL_IncTick();
-}
-
-void USART2_IRQHandler(void)
-{
-    HAL_UART_IRQHandler(&huart2);
-}
+void SysTick_Handler(void) { HAL_IncTick(); }
+void USART2_IRQHandler(void) { HAL_UART_IRQHandler(&huart2); }
